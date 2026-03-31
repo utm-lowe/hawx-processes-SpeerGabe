@@ -54,6 +54,22 @@ proc_init(void)
     //           vm_page_alloc
     //           vm_page_insert
     // YOUR CODE HERE
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &proc[i];
+        p->state = UNUSED;
+
+        // Allocate the kernel stack page
+        p->kstack = (uint64)vm_page_alloc();
+        if (!p->kstack)
+            panic("out of memory for kstack");
+
+        // Compute virtual address for the top of this process's kernel stack
+        uint64 kstack_va = TRAMPOLINE - (i + 1) * 2 * PGSIZE;
+
+        // Map the stack into the kernel page table
+        if (vm_page_insert(kernel_pagetable, kstack_va, p->kstack, PTE_W | PTE_R) < 0)
+            panic("vm_page_insert failed for kstack");
+}
 }
 
 
@@ -63,7 +79,6 @@ struct proc*
 proc_load_user_init(void)
 {
     void *bin = &_binary_user_init_start;
-    struct proc *p = 0x00;
 
     // Allocate a new process. If there is no process avaialble, panic.
     // Use proc_load_elf to load up the elf string. 
@@ -71,7 +86,15 @@ proc_load_user_init(void)
     // for you. The bin pointer points to the embedded BLOB which
     // contains the program image for init.
     // YOUR CODE HERE
+    struct proc *p = proc_alloc();
+    if(p == 0)
+        panic("proc_load_user_init: no free process");
 
+    if(proc_load_elf(p, bin) < 0)
+        panic("proc_load_user_init: failed to load init ELF");
+
+    // Trapframe already set in proc_load_elf
+    p->state = RUNNABLE;
     return p;
 }
 
@@ -102,6 +125,34 @@ proc_alloc(void)
     //          memset
     //          proc_pagetable
     // YOUR CODE HERE
+    struct proc *p;
+    for(int i = 0; i < NPROC; i++){
+        p = &proc[i];
+        if(p->state == UNUSED){
+            p->state = USED;
+            p->pid = nextpid++;
+            
+            //Trapframe allocation
+            p->trapframe = (struct trapframe*)vm_page_alloc();
+            if(!p->trapframe){
+                p->state = UNUSED;
+                return 0;
+            }
+            memset(p->trapframe, 0, PGSIZE);
+
+            //pagetable allocation
+            p->pagetable = proc_pagetable(p);
+            if(!p->pagetable){
+                vm_page_free(p->trapframe);
+                p->state = UNUSED;
+                return 0;
+            }
+
+            p->context.ra = (uint64)usertrapret;  // trampoline return
+            p->context.sp = p->kstack + PGSIZE;   // top of stack
+            return p;
+        }
+    }
     return 0;
 }
 
@@ -118,6 +169,25 @@ proc_free(struct proc *p)
     //         vm_page_free
     //         proc_free_pagetable
     // YOUR CODE HERE
+    if (!p) return;
+
+    // Free trapframe
+    if (p->trapframe)
+        vm_page_free((void*)p->trapframe);
+
+    // Free kernel stack
+    if (p->kstack)
+        vm_page_free((void*)p->kstack);
+
+    // Free user page table
+    if (p->pagetable)
+        proc_free_pagetable(p->pagetable, p->sz);
+
+    // Clear the process struct
+    memset(p, 0, sizeof(*p));
+
+    // Mark UNUSED at the very end
+    p->state = UNUSED;
 }
 
 
@@ -170,9 +240,65 @@ proc_load_elf(struct proc *p, void *bin)
     //       exec works in xv6. Happy reading!
     // YOUR CODE HERE
 
-bad:
-    // YOUR CODE HERE
-    return -1;
+    // 1) Create new pagetable
+    pagetable = proc_pagetable(p);
+    if (pagetable == 0)
+        goto bad;
+
+    // 2) Load each program segment
+    for (i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
+        ph = *(struct proghdr*)((char*)bin + off);
+
+        if (ph.type != ELF_PROG_LOAD)
+            continue;
+
+        // Sanity checks
+        if (ph.memsz < ph.filesz) goto bad;
+        if (ph.vaddr + ph.memsz < ph.vaddr) goto bad;
+
+        // Grow process memory to hold segment
+        if (proc_resize(pagetable, sz, ph.vaddr + ph.memsz) == 0)
+            goto bad;
+
+        // Load segment into memory
+        if (proc_loadseg(pagetable, ph.vaddr, bin, ph.off, ph.filesz) < 0)
+            goto bad;
+
+        // Update process size
+        if (sz < ph.vaddr + ph.memsz)
+            sz = ph.vaddr + ph.memsz;
+    }
+
+    // 3) Set up user stack: 2 pages (1 guard, 1 stack)
+    uint64 stack_base = PGROUNDUP(sz);
+    if(proc_resize(pagetable, sz, stack_base + 2*PGSIZE) == 0)
+        goto bad;
+
+    // Guard page at first page
+    proc_guard(pagetable, stack_base);
+
+    // Stack pointer at top of second page
+    sp = stack_base + 2*PGSIZE;
+    sp &= ~0xF;
+
+    // 4) Commit new image
+    proc_free_pagetable(p->pagetable, p->sz);
+    p->pagetable = pagetable;
+    p->sz = sz + 2*PGSIZE;
+
+    // 5) Initialize trapframe
+    p->trapframe->epc = elf.entry;
+    p->trapframe->sp  = sp;
+
+    // 6) Mark runnable
+    p->state = RUNNABLE;
+
+    return 0;
+
+  bad:
+      if (pagetable)
+          proc_free_pagetable(pagetable, sz);
+      return -1;
 }
 
 
@@ -188,7 +314,20 @@ uint64 proc_resize(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
     // xv6 equivalent. What did I change? 
     //
     // YOUR CODE HERE
-    return 0;
+    if(newsz > oldsz){
+        for(uint64 a = PGROUNDUP(oldsz); a < PGROUNDUP(newsz); a += PGSIZE){
+            void *mem = vm_page_alloc();
+            if(!mem) return 0;
+            memset(mem, 0, PGSIZE);
+            if(vm_page_insert(pagetable, a, (uint64)mem, PTE_W | PTE_R | PTE_U) < 0){
+                vm_page_free(mem);
+                return 0;
+            }
+        }
+    } else if(newsz < oldsz){
+        return proc_shrink(pagetable, oldsz, newsz);
+    }
+    return newsz;
 }
 
 
@@ -209,7 +348,33 @@ proc_vmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   // You should also make sure to handle errors as was done in the xv6
   // table.
   // YOUR CODE HERE
-  return -1;
+  for (uint64 addr = 0; addr < sz; addr += PGSIZE) {
+        // Get the PTE for this virtual address in the old page table
+        pte_t *pte_old = walk_pgtable(old, addr, 0);
+        if (!pte_old || !(*pte_old & PTE_V))
+            continue; // skip unmapped pages
+
+        // Get physical address of old page
+        uint64 pa_old = PTE2PA(*pte_old);
+
+        // Allocate a new page for the child
+        void *mem = vm_page_alloc();
+        if (!mem)
+            return -1;
+
+        // Copy the contents from the parent page
+        memmove(mem, (void*)pa_old, PGSIZE);
+
+        // Get permissions from old PTE
+        int perm = PTE_FLAGS(*pte_old) & (PTE_U | PTE_R | PTE_W | PTE_X);
+
+        // Map new page into the child's page table
+        if (vm_page_insert(new, addr, (uint64)mem, perm) < 0) {
+            vm_page_free(mem);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 
@@ -235,7 +400,23 @@ proc_pagetable(struct proc *p)
     //    vm_page_free
     //    vm_page_remove
     // YOUR CODE HERE
-    return 0;
+    pagetable_t pt = vm_create_pagetable();
+    if(pt == 0)
+        return 0;
+
+    // Map trampoline
+    if (vm_page_insert(pt, TRAMPOLINE, (uint64)trampoline, PTE_X | PTE_R) < 0){
+        vm_page_free(pt);
+        return 0;
+    }
+
+    // Map trapframe
+    if(vm_page_insert(pt, TRAPFRAME, (uint64)p->trapframe, PTE_W | PTE_R) < 0){
+        vm_page_free(pt);
+        return 0;
+    }
+
+    return pt;
 }
 
 
@@ -251,6 +432,21 @@ proc_free_pagetable(pagetable_t pagetable, uint64 sz)
     // 3.) Free the user page table.
     // Functions Used: vm_page_remove, proc_freewalk
     // YOUR CODE HERE
+    if (!pagetable)
+        return;
+
+    // 1) Remove TRAMPOLINE and TRAPFRAME mappings
+    vm_page_remove(pagetable, TRAMPOLINE, 1, 0); // trampoline: do not free physical page
+    vm_page_remove(pagetable, TRAPFRAME, 1, 0);  // trapframe: do not free physical page
+
+    // 2) Remove all user memory pages
+    if (sz > 0){
+        uint64 npages = (PGROUNDUP(sz)) / PGSIZE;
+        vm_page_remove(pagetable, 0, npages, 1); // free user pages
+    }
+
+    // 3) Free the top-level page table itself (recursively)
+    proc_freewalk(pagetable);
 }
 
 
@@ -314,8 +510,25 @@ proc_loadseg(pagetable_t pagetable, uint64 va, void *bin, uint offset, uint sz)
   // As an added hint, I have included my variable declarations 
   // above.
   // YOUR CODE HERE
-  
-  return -1;
+  char *src = (char*)bin + offset; // pointer to ELF segment data
+
+    // Loop over the segment in page-sized increments
+    for (i = 0; i < sz; i += PGSIZE) {
+        pte_t *pte = walk_pgtable(pagetable, va + i, 0);
+        if (!pte || !(*pte & PTE_V))
+            return -1;
+
+        pa = PTE2PA(*pte);
+
+        n = PGSIZE;
+        if (sz - i < PGSIZE)
+            n = sz - i;
+
+        // Copy into physical page, handle offset within page
+        memmove((void*)(pa + ((va + i) % PGSIZE)), src + i, n);
+    }
+
+    return 0;
 }
 
 
